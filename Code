@@ -1,0 +1,379 @@
+/*
+ * ============================================================
+ *   SMART HELMET — NodeMCU ESP8266
+ *   Fixes: Button debounce | GPS debug | Impact+GPS alert
+ * ============================================================
+ *
+ *  WIRING:
+ *  MPU6050  SDA → GPIO4  (D2)
+ *  MPU6050  SCL → GPIO5  (D1)
+ *  HC-SR04  TRIG → GPIO14 (D5)
+ *  HC-SR04  ECHO → GPIO12 (D6)  [1kΩ+1kΩ divider → 2.5V]
+ *  GPS      TX  → GPIO13 (D7)   [GPS RX not connected]
+ *  Buzzer   NPN → GPIO15 (D8)   [via 1kΩ]
+ *  MQ-3     DO  → GPIO2  (D4)
+ *  Button       → GPIO16 (D0)   [10kΩ pull-up to 3.3V — REQUIRED]
+ *
+ *  LIBRARIES (Library Manager):
+ *  - Adafruit MPU6050
+ *  - Adafruit Unified Sensor
+ *  - TinyGPS++
+ *  - Universal Arduino Telegram Bot
+ *  - ArduinoJson
+ *
+ *  BOARD: NodeMCU 1.0 (ESP-12E Module)
+ * ============================================================
+ */
+
+#include <Wire.h>
+#include <Adafruit_MPU6050.h>
+#include <Adafruit_Sensor.h>
+#include <SoftwareSerial.h>
+#include <TinyGPS++.h>
+#include <ESP8266WiFi.h>
+#include <ESP8266HTTPClient.h>
+#include <WiFiClientSecure.h>
+#include <UniversalTelegramBot.h>
+
+// ─────────────────────────────────────────
+//  CREDENTIALS
+// ─────────────────────────────────────────
+const char* WIFI_SSID     = "Manjari";
+const char* WIFI_PASSWORD = "QAZWSXEDC";
+const char* BOT_TOKEN     = "8887123632:AAH5WONilP2P9A9bvLbrwFeVeJuf6 4Yolxc";
+const char* CHAT_ID       = "7147038083";
+
+// ─────────────────────────────────────────
+//  GPIO PINS
+// ─────────────────────────────────────────
+const uint8_t PIN_TRIG    = 14;  // D5
+const uint8_t PIN_ECHO    = 12;  // D6
+const uint8_t PIN_BUZZER  = 15;  // D8
+const uint8_t PIN_ALCOHOL =  2;  // D4
+const uint8_t PIN_BUTTON  = 16;  // D0 — needs external 10kΩ to 3.3V
+const uint8_t PIN_GPS_RX  = 13;  // D7
+const uint8_t PIN_GPS_TX  =  0;  // D3 — dummy, GPS RX not connected
+
+// ─────────────────────────────────────────
+//  THRESHOLDS
+// ─────────────────────────────────────────
+// Impact: tune this value
+// 3.0  = gentle shake (testing)
+// 8.0  = hard knock
+// 15.0 = real crash/fall
+const float IMPACT_THRESHOLD = 8.0;
+
+const int   OBSTACLE_CM      = 30;
+const unsigned long COOLDOWN = 15000UL;  // 15s between same alert
+
+// ─────────────────────────────────────────
+//  OBJECTS
+// ─────────────────────────────────────────
+Adafruit_MPU6050     mpu;
+SoftwareSerial       gpsSerial(PIN_GPS_RX, PIN_GPS_TX);
+TinyGPSPlus          gps;
+WiFiClientSecure     secureClient;
+UniversalTelegramBot bot(BOT_TOKEN, secureClient);
+
+// ─────────────────────────────────────────
+//  STATE
+// ─────────────────────────────────────────
+float         gpsLat    = 0.0;
+float         gpsLng    = 0.0;
+bool          gpsValid  = false;
+
+unsigned long tImpact   = 0;
+unsigned long tDrunk    = 0;
+unsigned long tObstacle = 0;
+unsigned long tButton   = 0;
+
+bool impactPending = false;
+unsigned long impactStartTime = 0;
+
+// Button debounce
+bool          lastBtnState    = false;
+unsigned long lastBtnDebounce = 0;
+const unsigned long DEBOUNCE_MS = 50;
+
+// GPS sentence counter for debug
+unsigned long gpsCharsReceived = 0;
+
+// ─────────────────────────────────────────
+//  HELPERS
+// ─────────────────────────────────────────
+
+void buzzerBeep(int times, int onMs, int offMs) {
+  for (int i = 0; i < times; i++) {
+    digitalWrite(PIN_BUZZER, HIGH);
+    delay(onMs);
+    digitalWrite(PIN_BUZZER, LOW);
+    if (i < times - 1) delay(offMs);
+  }
+}
+
+bool cooldown(unsigned long &last) {
+  if (millis() - last >= COOLDOWN) {
+    last = millis();
+    return true;
+  }
+  return false;
+}
+
+void tgramSend(const String& msg)
+{
+  if (WiFi.status() != WL_CONNECTED)
+  {
+    Serial.println("[TG] WiFi offline");
+    return;
+  }
+
+  Serial.println("[TG] Connecting to Telegram...");
+
+  secureClient.setInsecure();
+  secureClient.setTimeout(15000);
+
+  bool ok = bot.sendMessage(CHAT_ID, msg, "");
+
+  if (ok)
+  {
+    Serial.println("[TG] MESSAGE SENT");
+  }
+  else
+  {
+    Serial.println("[TG] SEND FAILED");
+
+    Serial.print("WiFi status: ");
+    Serial.println(WiFi.status());
+
+    Serial.print("Heap: ");
+    Serial.println(ESP.getFreeHeap());
+  }
+}
+
+// Returns Google Maps link if GPS valid, else last known or "no fix"
+String locationStr() {
+  if (gpsValid) {
+    return "Location: https://maps.google.com/?q="
+           + String(gpsLat, 6) + "," + String(gpsLng, 6);
+  }
+  return "Location: GPS no fix yet (indoors? wait for open sky)";
+}
+
+void feedGPS() {
+  while (gpsSerial.available()) {
+    char c = gpsSerial.read();
+    gps.encode(c);
+    gpsCharsReceived++;
+  }
+  if (gps.location.isValid()) {
+    gpsLat   = gps.location.lat();
+    gpsLng   = gps.location.lng();
+    gpsValid = true;
+  }
+}
+
+float readDistance() {
+  digitalWrite(PIN_TRIG, LOW);
+  delayMicroseconds(2);
+  digitalWrite(PIN_TRIG, HIGH);
+  delayMicroseconds(10);
+  digitalWrite(PIN_TRIG, LOW);
+  long d = pulseIn(PIN_ECHO, HIGH, 40000UL);
+  return (d == 0) ? -1.0f : (d * 0.0343f) / 2.0f;
+}
+
+bool impactDetected(float ax, float ay, float az) {
+  float mag = sqrt(ax * ax + ay * ay + az * az);
+  float dev = fabs(mag - 9.8f);
+  return dev > IMPACT_THRESHOLD;
+}
+
+// Debounced button read — returns true only on clean press
+bool buttonPressed() {
+  bool reading = (digitalRead(PIN_BUTTON) == LOW);
+  if (reading != lastBtnState) {
+    lastBtnDebounce = millis();
+  }
+  lastBtnState = reading;
+  if ((millis() - lastBtnDebounce) > DEBOUNCE_MS) {
+    return reading;
+  }
+  return false;
+}
+
+// ═══════════════════════════════════════════
+//  SETUP
+// ═══════════════════════════════════════════
+void setup() {
+  Serial.begin(115200);
+  delay(300);
+  Serial.println(F("\n============================"));
+  Serial.println(F("   SMART HELMET BOOTING"));
+  Serial.println(F("============================"));
+
+  pinMode(PIN_TRIG,    OUTPUT); digitalWrite(PIN_TRIG,   LOW);
+  pinMode(PIN_ECHO,    INPUT);
+  pinMode(PIN_BUZZER,  OUTPUT); digitalWrite(PIN_BUZZER, LOW);
+  pinMode(PIN_ALCOHOL, INPUT);
+  pinMode(PIN_BUTTON,  INPUT);  // GPIO16 — external 10kΩ to 3.3V required!
+
+  // MPU6050
+  Wire.begin(4, 5);  // SDA=GPIO4, SCL=GPIO5
+  if (!mpu.begin()) {
+    Serial.println(F("[ERR] MPU6050 not found!"));
+    while (true) { buzzerBeep(3, 100, 100); delay(1000); }
+  }
+  mpu.setAccelerometerRange(MPU6050_RANGE_8_G);
+  mpu.setGyroRange(MPU6050_RANGE_500_DEG);
+  mpu.setFilterBandwidth(MPU6050_BAND_21_HZ);
+  Serial.println(F("[OK] MPU6050 ready"));
+
+  // GPS
+  gpsSerial.begin(9600);
+  Serial.println(F("[OK] GPS SoftwareSerial ready on GPIO13"));
+  Serial.println(F("[NOTE] GPS needs OPEN SKY for fix — no fix indoors!"));
+
+  // WiFi
+  Serial.print(F("[..] Connecting to WiFi"));
+  WiFi.mode(WIFI_STA);
+  WiFi.begin(WIFI_SSID, WIFI_PASSWORD);
+  for (int i = 0; i < 30 && WiFi.status() != WL_CONNECTED; i++) {
+    delay(500); Serial.print('.');
+  }
+  if (WiFi.status() == WL_CONNECTED) {
+  secureClient.setInsecure();   // move FIRST
+
+  Serial.println(F("\n[OK] WiFi connected: ") + WiFi.localIP().toString());
+
+  bool ok = bot.sendMessage(CHAT_ID,
+                            "Smart Helmet ONLINE.\nImpact threshold: " + String(IMPACT_THRESHOLD) + " m/s2",
+                            "");
+
+  Serial.println(ok ? F("[TG] Startup message OK") : F("[TG] Startup message FAILED"));
+}
+    Serial.println(F("\n[WARN] WiFi failed — running offline"));
+  
+
+  // MQ-3 warm-up
+  Serial.println(F("[..] MQ-3 warm-up 60s..."));
+  for (int i = 6; i > 0; i--) {
+    Serial.print(i * 10); Serial.println(F("s..."));
+    buzzerBeep(1, 80, 0);
+    delay(10000);
+  }
+  Serial.println(F("[OK] MQ-3 ready"));
+
+  buzzerBeep(2, 150, 100);
+  Serial.println(F("[READY]\n"));
+  Serial.println(F("Format: Dist | Alc | Imp | GPS | Btn | GPS_chars_recv"));
+  Serial.println(F("-----------------------------------------------------------"));
+}
+
+// ═══════════════════════════════════════════
+//  LOOP
+// ═══════════════════════════════════════════
+void loop() {
+   while (gpsSerial.available())
+  {
+    gps.encode(gpsSerial.read());
+  }
+
+  Serial.print("Satellites: ");
+  Serial.println(gps.satellites.value());
+
+  Serial.print("Valid location: ");
+  Serial.println(gps.location.isValid());
+  // Feed GPS every loop
+  feedGPS();
+
+  // MPU6050
+  sensors_event_t a, g, t;
+  mpu.getEvent(&a, &g, &t);
+  float ax = a.acceleration.x;
+  float ay = a.acceleration.y;
+  float az = a.acceleration.z;
+
+  // Sensors
+  float dist     = readDistance();
+  bool  drunk    = (digitalRead(PIN_ALCOHOL) == LOW);
+  bool  impact   = impactDetected(ax, ay, az);
+  bool  obstacle = (dist > 0 && dist < OBSTACLE_CM);
+  bool  btn      = buttonPressed();
+
+  // ── ALERTS ──
+
+  // IMPACT DETECTED - START 20s TIMER
+  if (impact && !impactPending && cooldown(tImpact))
+  {
+    impactPending = true;
+    impactStartTime = millis();
+
+    Serial.println(F("\n[ALERT] Impact detected!"));
+    Serial.println(F("[INFO] Waiting 20 seconds for rider confirmation..."));
+
+    digitalWrite(PIN_BUZZER, HIGH);
+  }
+
+  // IMPACT CONFIRMATION WINDOW
+  if (impactPending)
+  {
+    if (buttonPressed())
+    {
+      impactPending = false;
+      digitalWrite(PIN_BUZZER, LOW);
+
+      Serial.println(F("[INFO] Accident alert cancelled by rider"));
+      buzzerBeep(2, 100, 100);
+    }
+    else if (millis() - impactStartTime >= 20000)
+    {
+      digitalWrite(PIN_BUZZER, LOW);
+
+      Serial.println(F("[ALERT] No response from rider"));
+      Serial.println(F("[ALERT] Sending accident notification"));
+
+      tgramSend("ACCIDENT ALERT!\nHelmet impact detected.\n" + locationStr());
+
+      impactPending = false;
+    }
+  }
+
+  // DRUNK
+  if (drunk && cooldown(tDrunk)) {
+    buzzerBeep(5, 100, 80);
+    Serial.println(F("\n[ALERT] *** ALCOHOL DETECTED! ***"));
+    tgramSend("ALCOHOL ALERT!\nRider may be drunk. Do not ride!");
+  }
+
+  // OBSTACLE
+  if (obstacle && cooldown(tObstacle)) {
+    buzzerBeep(1, 150, 0);
+    Serial.println(F("\n[WARN] Obstacle nearby!"));
+    tgramSend("OBSTACLE WARNING!\nObject " + String(dist, 1) + "cm ahead.\n" + locationStr());
+  }
+
+  // SOS button disabled - button only cancels accident countdown
+
+  // ── SERIAL STATUS ──
+  Serial.print(F("Dist: "));
+  Serial.print(dist < 0 ? -1 : (int)dist);
+  Serial.print(F(" cm | "));
+
+  Serial.print(F("Alcohol: "));
+  Serial.print(drunk ? F("YES") : F("NO"));
+
+  Serial.print(F(" | Impact: "));
+  Serial.print(impact ? F("YES") : F("NO"));
+
+  Serial.print(F(" | GPS: "));
+  if (gpsValid) {
+    Serial.print(gpsLat, 4);
+    Serial.print(',');
+    Serial.print(gpsLng, 4);
+  } else {
+    Serial.print(F("NO FIX"));
+  }
+  Serial.println();
+
+  delay(250);
+}
